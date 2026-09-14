@@ -544,16 +544,29 @@
   function todayISO(){ var d=new Date(); return d.toISOString().slice(0,10); }
 
   function defaultData(){
+    /* Default starter roster (Ben's request, 2026-09-14) — a brand-new install
+       (no localStorage data yet) starts pre-loaded with this team/roster instead
+       of an empty "My Team", so there's something to try Team Log with right
+       away. Rename/add/remove players and teams freely from the Team tab —
+       this only ever applies once, to a fresh install. */
     var tid = uid();
-    var pid = uid();
+    var jariId = uid();
+    var profiles = [{id:jariId, name:'Jari', flipSides:false, teamId:tid}];
+    var roster = [
+      {id:jariId, number:'74', name:'Jari', position:'G', teamId:tid},
+      {id:uid(), number:'88', name:'Hugo', position:'F', teamId:tid},
+      {id:uid(), number:'89', name:'Filipp', position:'D', teamId:tid},
+      {id:uid(), number:'9', name:'Magnus', position:'F', teamId:tid},
+      {id:uid(), number:'14', name:'Noah', position:'D', teamId:tid}
+    ];
     return {
-      teams: [{id:tid, name:'My Team'}],
+      teams: [{id:tid, name:'Jar test'}],
       activeTeamId: tid,
-      profiles: [{id:pid, name:'Me', flipSides:false, teamId:tid}],
-      activeProfileId: pid,
+      profiles: profiles,
+      activeProfileId: jariId,
       activeSessionId: null,
       sessions: [],
-      roster: []
+      roster: roster
     };
   }
 
@@ -622,6 +635,26 @@
   function renameTeam(id, name){
     var t = getTeam(id);
     if(t){ t.name = name; persist(); }
+  }
+  function deleteTeam(id){
+    /* Deliberately full cascade delete (2026-09-14, Ben's request) — teams are
+       fully separate (own roster + own goalie pool + own sessions), so removing
+       one removes everything scoped to it. Always leaves at least one team. */
+    if(teamList().length<=1){ showToast('You need at least one other team before you can delete this one.'); return false; }
+    var t = getTeam(id);
+    if(!t) return false;
+    DATA.teams = DATA.teams.filter(function(x){return x.id!==id;});
+    DATA.profiles = DATA.profiles.filter(function(p){return p.teamId!==id;});
+    DATA.roster = DATA.roster.filter(function(p){return p.teamId!==id;});
+    DATA.sessions = DATA.sessions.filter(function(s){return s.teamId!==id;});
+    if(DATA.activeSessionId && !getSession(DATA.activeSessionId)) DATA.activeSessionId = null;
+    if(DATA.activeTeamId===id){
+      DATA.activeTeamId = teamList()[0].id;
+      var teamProfiles = DATA.profiles.filter(function(p){return p.teamId===DATA.activeTeamId;});
+      DATA.activeProfileId = teamProfiles.length ? teamProfiles[0].id : null;
+    }
+    persist();
+    return true;
   }
   function profileSessions(){
     return DATA.sessions.filter(function(s){return s.profileId===DATA.activeProfileId;});
@@ -1017,7 +1050,8 @@
       type: s.type,
       format: FORMATS.indexOf(s.format)!==-1 ? s.format : 'Other',
       formatOther: FORMATS.indexOf(s.format)!==-1 ? '' : (s.format||''),
-      homeAway: s.homeAway || 'home'
+      homeAway: s.homeAway || 'home',
+      goalieInNetId: s.goalieInNetId || ''
     };
     function body(){
       return (
@@ -1035,6 +1069,7 @@
           '<label>Custom format</label><input type="text" id="esFormatOther" value="'+esc(state.formatOther)+'" placeholder="e.g. 2v0 shootout"></div>'+
         '<div class="field" id="esContextWrap"></div>'+
         (isTeam ? '<div class="field" id="esHomeAwayWrap"></div>' : '')+
+        (isTeam ? '<div class="field" id="esGoalieWrap"></div>' : '')+
         '<div class="field"><label>Period length (minutes)</label><input type="number" id="esPeriodLen" min="1" max="60" value="'+(s.periodLengthMin||DEFAULT_PERIOD_LENGTH_MIN)+'"></div>'+
         '<div class="field"><label>Notes (optional)</label><textarea id="esNotes" placeholder="Anything worth remembering...">'+esc(s.notes||'')+'</textarea></div>'+
         '<div class="modal-actions">'+
@@ -1066,9 +1101,24 @@
         wrap.querySelectorAll('#esHomeAway button').forEach(function(x){x.classList.toggle('on', x===b);});
       });
     }
+    function renderGoalieField(root){
+      if(!isTeam) return;
+      var wrap = root.querySelector('#esGoalieWrap');
+      if(!wrap) return;
+      var goalies = filterByAllowed(rosterByPositionForTeam(s.teamId).G, s.activeRosterIds);
+      if(!goalies.length){
+        wrap.innerHTML = '<label>Goalie in net</label><p class="center-note">No goalies on the roster yet — add one from the Team tab.</p>';
+        return;
+      }
+      wrap.innerHTML = '<label>Goalie in net</label><select id="esGoalie"><option value="">— none set</option>'+
+        goalies.map(function(g){return '<option value="'+g.id+'" '+(g.id===state.goalieInNetId?'selected':'')+'>#'+esc(g.number||'')+' '+esc(g.name)+'</option>';}).join('')+
+      '</select>';
+      wrap.querySelector('#esGoalie').addEventListener('change', function(){ state.goalieInNetId = this.value; });
+    }
     openModal(body(), {onMount:function(root){
       renderContext(root);
       renderHomeAway(root);
+      renderGoalieField(root);
       root.querySelector('#esType').addEventListener('click', function(e){
         var b = e.target.closest('button'); if(!b) return;
         state.type = b.getAttribute('data-v');
@@ -1096,7 +1146,17 @@
         s.drill = state.type==='practice' ? (root.querySelector('#esDrill')||{value:''}).value.trim() : '';
         s.notes = root.querySelector('#esNotes').value.trim();
         s.periodLengthMin = periodLen;
-        if(isTeam){ s.homeAway = state.type==='game' ? state.homeAway : ''; }
+        if(isTeam){
+          s.homeAway = state.type==='game' ? state.homeAway : '';
+          var newGoalieId = state.goalieInNetId || null;
+          if(newGoalieId !== (s.goalieInNetId||null)){
+            s.goalieInNetId = newGoalieId;
+            if(newGoalieId){
+              if(!s.goalieStints) s.goalieStints = [];
+              s.goalieStints.push({goalieId:newGoalieId, period:s.currentPeriod||1, clock:null, ts:Date.now()});
+            }
+          }
+        }
         persist();
         closeModal();
         showToast('Session info updated.');
@@ -2302,9 +2362,10 @@
         '<div class="field"><label>Active Team</label><select id="teamSwitchSel">'+
           teamList().map(function(t){ return '<option value="'+t.id+'"'+(t.id===DATA.activeTeamId?' selected':'')+'>'+esc(t.name)+'</option>'; }).join('')+
         '</select></div>'+
-        '<div style="display:flex;gap:16px;">'+
+        '<div style="display:flex;gap:16px;flex-wrap:wrap;">'+
           '<button class="link-btn" id="newTeamBtn">+ New Team</button>'+
           '<button class="link-btn" id="renameTeamBtn">Rename This Team</button>'+
+          (teamList().length>1 ? '<button class="link-btn" id="deleteTeamBtn" style="color:var(--red);">Delete This Team</button>' : '')+
         '</div>'+
         '<p class="center-note" style="margin-top:6px;">Each team has its own roster and its own goalies — New Session, this roster, and the season stats below all follow whichever team is active here.</p>'+
       '</div>';
@@ -2386,6 +2447,17 @@
       openTeamNameModal('Rename Team', activeTeam().name, function(name){
         renameTeam(DATA.activeTeamId, name);
         renderTeamScreen();
+      });
+    });
+    var deleteTeamBtn = el.querySelector('#deleteTeamBtn');
+    if(deleteTeamBtn) deleteTeamBtn.addEventListener('click', function(){
+      var name = activeTeam().name;
+      confirmAction('Delete "'+name+'" — this permanently removes its entire roster and all of its session history (both Goalie Log and Team Log). This cannot be undone. Export any stats you want to keep first.', function(){
+        var id = DATA.activeTeamId;
+        if(deleteTeam(id)){
+          renderTeamScreen();
+          showToast('Deleted '+name+'.');
+        }
       });
     });
     el.querySelectorAll('.pos-toggle').forEach(function(badge){
